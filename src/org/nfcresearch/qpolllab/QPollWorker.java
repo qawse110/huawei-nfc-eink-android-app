@@ -109,7 +109,26 @@ public final class QPollWorker {
     private static int qtag(int action) throws Exception {
         return vendor(15,112,new byte[]{0x31,(byte)action});
     }
-    private static int vendor(int gid,int oid,byte[] payload)throws Exception {
+    private static boolean vendorChecked, vendorOk;
+    /**
+     * INfcAdapter.sendVendorNciMessage exists from Android 13 on. Android 12 and older expose no
+     * in-stack vendor NCI entry at all (its vendor interface has no raw send either), so QTag and
+     * direct Q-Poll cannot run there; the HAL compatibility layer still can.
+     */
+    private static boolean vendorAvailable() {
+        if (vendorChecked) return vendorOk;
+        try {
+            adapterType.getMethod("sendVendorNciMessage", int.class, int.class, int.class, byte[].class);
+            vendorOk = true;
+        } catch (NoSuchMethodException missing) {
+            vendorOk = false;
+        }
+        vendorChecked = true;
+        return vendorOk;
+    }
+    private static int vendor(int gid,int oid,byte[] payload) throws Exception {
+        if(!vendorAvailable())
+            throw new java.io.IOException("该系统没有 sendVendorNciMessage（Android 12 及更低）：系统 QTag 与直接 Q-Poll 不可用，请改用「NXP HAL 兼容」寻卡方式");
         return (Integer) invoke("sendVendorNciMessage", new Class<?>[]{int.class,int.class,int.class,byte[].class},
                 1, gid, oid, payload);
     }
@@ -224,15 +243,16 @@ public final class QPollWorker {
                 init();
                 if (args[0].equals("inspect")) {
                     emit("CHIP",ChipInfo.inspect());
-                    adapterType.getMethod("sendVendorNciMessage", int.class, int.class, int.class, byte[].class);
-                    emit("READY", "NXP 测试入口存在，可开始测试（尚未验证空口能力）");
+                    emit("READY", vendorAvailable()
+                        ? "NXP 测试入口存在，可开始测试（尚未验证空口能力）"
+                        : "系统无 sendVendorNciMessage（Android 12 及更低）：系统 QTag 不可用，寻卡请选择「NXP HAL 兼容」");
                     emit("END", "权限检查完成，未发送寻卡命令"); return;
                 }
                 if (stopFile.exists()) { emit("END", "已取消，未启动寻卡"); return; }
                 setupCallback();
                 setupReaderMode();
-                if(directDiscovery){
-                    adapterType.getMethod("sendVendorNciMessage",int.class,int.class,int.class,byte[].class);
+                if(directDiscovery) {
+                    if(!vendorAvailable())throw new java.io.IOException("该系统没有 sendVendorNciMessage（Android 12 及更低），直接 Q-Poll 不可用；请改用「NXP HAL 兼容」");
                     directSession=new DirectQPoll(QPollWorker::vendor,QPollWorker::reader,stopFile::exists,QPollWorker::emit);
                     emit("DIRECT","手动选择直接 Q-Poll；控制器响应、标签回调与刷屏分别验证");
                 }

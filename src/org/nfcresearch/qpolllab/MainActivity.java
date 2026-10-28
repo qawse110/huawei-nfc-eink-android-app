@@ -29,7 +29,7 @@ public final class MainActivity extends Activity {
     private final Handler main=new Handler();
     private final ArrayList<View> idleControls=new ArrayList<>();
     private final StringBuilder transcript=new StringBuilder();
-    private final int[] durations={5,10,30,60},powerTimes={500,1000,2000,3000,4000,5000},pollTimes={0,10,20,50,100,200,300,400,500},blockSizes={1,2,4,8,16};
+    private final int[] durations={5,10,30,60},powerTimes={500,1000,2000,3000,4000,5000,6000,8000,10000},pollTimes={0,10,20,50,100,200,300,400,500},blockSizes={1,2,4,8,16};
     private TextView state,detail,log,imageInfo,thresholdLabel,chargeTiming,refreshTiming;
     private PixelPreview preview,editPreview;
     private TextView editInfo,failureInfo,deviceFeedback,editorLocked;
@@ -272,12 +272,12 @@ public final class MainActivity extends Activity {
         blocks.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("blockSize",blockSizes[pos]).apply();if(pos>0)dither.setChecked(false);prepare();}public void onNothingSelected(AdapterView<?> p){}});
         panelType.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putString("panelType",selectedPanelType()).apply();prepare();controls();}public void onNothingSelected(AdapterView<?> p){}});
         fit.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){prepare();}public void onNothingSelected(AdapterView<?> p){}});
-
         page=pageBodies[2];section(page,"设置");page.addView(text("运行期间参数锁定，修改用于下一次操作。",12,0xff68766e));
         LinearLayout parameters=fold(page,"发送参数",false);
         section(parameters,"发送前充能时间");String[] chargeOptions=new String[31];for(int i=0;i<31;i++)chargeOptions[i]=i+" 秒"+(i==0?"（默认）":"");charge=spinner(chargeOptions);charge.setSelection(Math.max(0,Math.min(30,getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("chargeSeconds",0))));parameters.addView(charge);
         parameters.addView(text("连接屏幕后先保持贴合充能，再开始检查与传图。",12,0xff68766e));charge.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("chargeSeconds",pos).apply();}public void onNothingSelected(AdapterView<?> p){}});
-        section(parameters,"发送后上电等待时间");power=spinner(new String[]{"500 ms","1000 ms","2000 ms（默认）","3000 ms","4000 ms","5000 ms"});int savedPower=getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("powerMs",2000),selectedPower=2;for(int i=0;i<powerTimes.length;i++)if(powerTimes[i]==savedPower)selectedPower=i;power.setSelection(selectedPower);parameters.addView(power);
+        section(parameters,"发送后上电等待时间");power=spinner(new String[]{"500 ms","1000 ms","2000 ms（默认）","3000 ms","4000 ms","5000 ms","6000 ms","8000 ms","10000 ms"});int savedPower=getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("powerMs",2000),selectedPower=2;for(int i=0;i<powerTimes.length;i++)if(powerTimes[i]==savedPower)selectedPower=i;power.setSelection(selectedPower);parameters.addView(power);
+        parameters.addView(text("写入刷新指令中的上电等待参数，用于屏幕刷新准备阶段。四色全刷约需 30 秒持续供能；若中途报「供电不足」而画面只刷了一部分，可提高到 5000 ms 以上重试（D4 应答时间会随之变长）。",12,0xff68766e));
         power.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("powerMs",powerTimes[pos]).apply();}public void onNothingSelected(AdapterView<?> p){}});
         section(parameters,"状态查询间隔");poll=spinner(new String[]{"0 ms · 连续查询","10 ms","20 ms","50 ms","100 ms","200 ms","300 ms","400 ms","500 ms（默认）"});int savedPoll=getSharedPreferences("refresh-settings",MODE_PRIVATE).getInt("pollMs",PanelProtocol.DEFAULT_POLL_MS),selectedPoll=pollTimes.length-1;for(int i=0;i<pollTimes.length;i++)if(pollTimes[i]==savedPoll)selectedPoll=i;poll.setSelection(selectedPoll);parameters.addView(poll);
         poll.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int pos,long id){getSharedPreferences("refresh-settings",MODE_PRIVATE).edit().putInt("pollMs",pollTimes[pos]).apply();}public void onNothingSelected(AdapterView<?> p){}});
@@ -301,6 +301,9 @@ public final class MainActivity extends Activity {
         discoveryBackend=new BackendChoiceSpinner(this,"选择 Q-Poll 寻卡方式");idleControls.add(discoveryBackend);
         discoveryAdapter=new BackendChoiceAdapter(this,new String[]{"请选择寻卡方式","系统 QTag（默认）","NXP HAL 兼容（SN220 / SN100U，实验）","直接 Q-Poll（实验）"},new BackendChoiceAdapter.Details(){public String description(int position){return BackendOptions.discoveryDescription(position);}public String blockedReason(int position){return discoveryBlockedReason(position);}});
         discoveryAdapter.bindTo(discoveryBackend);discoveryBackend.setSelection(1);compatibility.addView(discoveryBackend);
+        // Android 12 and older have no INfcAdapter.sendVendorNciMessage: system QTag and direct
+        // Q-Poll cannot work there, so preselect the HAL compatibility layer instead of a dead option.
+        if(android.os.Build.VERSION.SDK_INT<33)discoveryBackend.setSelection(2);
         discoveryExplanation=text("",13,0xff52635d);compatibility.addView(discoveryExplanation);
         discoveryRestriction=text("",13,0xffa34b25);discoveryRestriction.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);compatibility.addView(discoveryRestriction);
         discoveryBackend.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> parent,View view,int position,long id){if(initializing||busy||updatingBackendChoices)return;if(position>0&&discoveryBlockedReason(position).isEmpty())backendChoiceNotice="";controls();}public void onNothingSelected(AdapterView<?> parent){}});
