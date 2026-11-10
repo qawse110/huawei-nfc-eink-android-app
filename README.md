@@ -86,6 +86,24 @@ APK 和 SHA-256 输出在 `dist/`。首次构建会在 `build/` 生成本地调�
 adb install -r dist/QPollLab-2.12.0-reader-test1.apk
 ```
 
+## CI 构建（GitHub Actions）
+
+本 fork 增加了 `.github/workflows/build-apk.yml`，在没有 Gradle 的前提下，用与本地一致的 `python3 build.py` 在 GitHub Actions 上验证并打包：
+
+1. 任意分支的 push 都会触发：检出 → JDK 17 → 安装/复用 Android SDK（平台 android-34、build-tools 34.0.0、NDK 27.2.12479018，缺失才装）→ `python3 tests/run_java.py`（失败即停）→ C 单元测试（ASan/UBSan，失败只记录）→ `python3 build.py` → 上传 APK 与 SHA-256 作为 workflow artifact。
+2. 手动触发（Actions → build-apk → Run workflow，可指定 ref）额外发布一个 **prerelease**，tag 形如 `ci-<short-sha>-<run-number>`，附带 `QPollLab-<versionName>.apk` 与同名 `.sha256` 文件，正文列出 commit、run 链接和测试结论。
+3. 仓库需要在 Settings → Actions → General → Workflow permissions 选择 **Read and write permissions**，否则手动触发的发布步骤会因 token 只读而失败（push 构建与 artifact 上传不受影响）。不需要任何 secrets。
+
+下载与校验：
+
+```sh
+# 从 Release 或 Actions artifact 取得 APK 与 .sha256 后，在同一目录执行
+sha256sum -c QPollLab-<versionName>.apk.sha256
+```
+
+注意：CI 每次运行都会用 `build/` 下临时生成的 debug keystore 重新签名，签名证书与其他构建/本地构建不通用，覆盖安装前先执行 `adb uninstall org.nfcresearch.qpolllab`。CI 产物仅供测试，不作为正式发布物；正式版本仍按本地构建流程产出并保留自己的密钥。
+
+
 ## 隐私
 
 本仓库仅包含 App 源码、测试、构建脚本、必要依赖与许可证。测试使用合成 UID，不包含原始手机日志、NFC 抓包或个人图片。
