@@ -12,6 +12,11 @@ public final class NxpHalPolicyTest {
         }
         for(String model:new String[]{"NXP PN553","NXP SN110","ST54L","",null})check(!NxpHalPolicy.supported(model),"No unrelated or unknown chip admitted at runtime");
         check(NxpHalPolicy.firmwareConfig("#NXP_FW_NAME=\"libsn100u_fw.so\"","test")==null,"Commented firmware is not evidence");
+        check(ChipInfo.isEvidenceCopy("libnfc-mtp-SN220.conf_22111"),"Oplus per-process firmware copy is scanned");
+        check(ChipInfo.isEvidenceCopy("libnfc-mtp-SN100U.conf_4096"),"Second chip copy is scanned");
+        check(ChipInfo.isEvidenceCopy("libnfc-mtp-SN220.conf"),"Un-suffixed vendor copy is admitted");
+        for(String unrelated:new String[]{"libnfc-nci.conf","other.txt","libnfc-mtp-SN220.conf.bak","libnfc-mtp-SN220.conf_12a","","xlibnfc-mtp-SN220.conf_1",null})
+            check(!ChipInfo.isEvidenceCopy(unrelated),"Unrelated files are ignored at runtime: "+unrelated);
         check(BackendOptions.transport(2).equals("sn220"),"Persisted transport identity remains stable");
         for(int i:new int[]{1,3})check(BackendOptions.blockedReason(2000,i,false,"NXP SN100U").isEmpty(),"Other discovery modes are independent");
         System.out.println("NxpHalPolicyTest: PASS (SN220/SN220U preserved, SN100U admitted, Root/arm64 retained, unrelated chips rejected, config parsing)");
