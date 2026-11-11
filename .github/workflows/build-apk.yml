@@ -1,0 +1,353 @@
+# QPollLab — 构建 / 测试 / 发布 GitHub Actions workflow。
+#
+# 本项目没有 Gradle：build.py 直接驱动 javac -> jar -> d8 --min-api 26 -> aapt ->
+# zipalign -> apksigner，因此 CI 只需要提供 Android SDK / NDK 本身（外加 JDK 17 与
+# python3），不下载任何第三方 App 依赖（Shizuku 的 4 个 13.1.5 AAR 已固定在 libs/）。
+#
+# ============================ 仓库侧需要配置的事项 ============================
+# 1) 在 Settings -> Actions -> General -> Workflow permissions 选择
+#    "Read and write permissions"（并保存）。
+#    fork 出来的仓库默认往往是只读 token，此时 push 构建与 artifact 上传都正常，
+#    但 workflow_dispatch 的"发布 Release"步骤会以 403 失败 —— 这不是 workflow 的
+#    bug，而是 token 权限不足。
+# 2) 不需要任何 secrets：本 workflow 只用自动提供的 github.token。
+# 3) 首次使用 workflow_dispatch 前，workflow 文件必须已存在于该仓库的某个分支上
+#    （GitHub 只从默认分支以外读不到的 workflow 不会出现在 UI 里）。
+#
+# ============================ 已知的坑（已在本文件中规避） ============================
+# * runner 镜像预装 android-34 与 build-tools 34.0.0，但**没有** NDK 27.2.12479018，
+#   且镜像已把 ANDROID_NDK_HOME 指向它自带的 27.3.x。若只依赖镜像默认值，build.py
+#   会去用另一个 NDK；本文件显式把 ANDROID_NDK_HOME 覆盖为 pinned 版本（见 install 步骤）。
+# * native/build.sh 把 host 工具链路径写死为 prebuilt/linux-x86_64，所以只能在 Linux
+#   runner 上跑（Windows 需 WSL）—— 这正是本 workflow 使用 ubuntu-latest 的原因。
+# * Ubuntu 24.04 提高了 vm.mmap_rnd_bits，ASan 启动即崩（shadow memory 冲突）；
+#   C 测试步骤里先 sysctl 调低，失败只告警。
+# * sdkmanager 在镜像上不一定在 PATH 上，且 cmdline-tools 目录名随镜像版本变化
+#   （12.0 / latest 都见过）；按目录搜索而不是硬编码路径。
+# * "yes | sdkmanager --licenses" 在 pipe 关闭时会让 yes 收到 SIGPIPE，
+#   配合 set -o pipefail 会误判失败；用 (yes || true) | ... || true 兜住。
+# * build.py 每次运行都用 keytool 生成全新的 debug keystore（build/ 不缓存），因此
+#   每次 CI 产出的 APK 签名证书都不同，无法与另一次构建/本地构建的 APK 覆盖安装；
+#   需要覆盖安装时先 adb uninstall org.nfcresearch.qpolllab。
+#   （想固定签名可自行把 build/debug.keystore 放进 Actions cache 或 secret，本文件
+#    默认不缓存密钥材料。）
+# =============================================================================
+name: build-apk
+
+on:
+  # 所有分支的 push 都构建：保证 PR head 与默认分支随时可验证。
+  push:
+  # 手动触发（可在 UI 里选任意 ref）。这是唯一会创建 GitHub Release 的触发方式。
+  workflow_dispatch:
+
+permissions:
+  # 发布 Release 需要写权限；push 构建 + artifact 上传用只读 token 也够。
+  contents: write
+
+# 同一 ref 的同一 workflow 只保留最新一次运行：避免强推/连推时两个 job 并行跑，
+# 也避免两个手动运行同时抢同一个 Release tag。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_API: '34'
+  BUILD_TOOLS_VERSION: '34.0.0'
+  # 与 README「构建与验证」段一致的 pinned NDK 版本。
+  NDK_VERSION: '27.2.12479018'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  build:
+    name: 构建已签名 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          # 取全历史：Release tag 与 short SHA 由 git 推导。
+          fetch-depth: 0
+          # 本 workflow 不推送任何东西，不保留凭据。
+          persist-credentials: false
+
+      - name: 安装 JDK 17 (temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          # 无 Gradle、无远程依赖，不需要 Gradle 缓存。
+
+      - name: 安装 Android SDK 组件（已装则跳过）
+        id: sdk
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK" || ! -d "$SDK" ]]; then
+            echo "::error::runner 上 ANDROID_HOME / ANDROID_SDK_ROOT 未指向已安装的 SDK"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          # sdkmanager 不一定在 PATH 上，且 cmdline-tools 的子目录名随镜像版本变化
+          # （12.0 / latest 都见过），所以在 SDK 内部按目录找，避免硬编码。
+          SDKMGR="$(command -v sdkmanager || true)"
+          if [[ -z "$SDKMGR" ]]; then
+            SDKMGR="$(find "$SDK/cmdline-tools" -maxdepth 3 -type f -name sdkmanager -print 2>/dev/null | sort -V | tail -n 1)" || true
+          fi
+          if [[ -z "$SDKMGR" ]]; then
+            echo "::error::在 $SDK/cmdline-tools 下找不到 sdkmanager"
+            exit 1
+          fi
+          echo "sdkmanager: $SDKMGR ($("$SDKMGR" --version 2>/dev/null | tail -n 1 || true))"
+
+          # 只装缺失的组件：anding 镜像已带 platform/build-tools，通常只需补 NDK。
+          missing=()
+          [[ -f "$SDK/platforms/android-$ANDROID_API/android.jar" ]] || missing+=("platforms;android-$ANDROID_API")
+          [[ -x "$SDK/build-tools/$BUILD_TOOLS_VERSION/d8" ]]         || missing+=("build-tools;$BUILD_TOOLS_VERSION")
+          [[ -d "$SDK/ndk/$NDK_VERSION" ]]                             || missing+=("ndk;$NDK_VERSION")
+
+          if (( ${#missing[@]} )); then
+            echo "需要安装：${missing[*]}"
+            # 镜像通常已接受 licenses；在裸 SDK 上靠管道 yes 自动同意。
+            # yes 被 SIGPIPE 打断不算失败（set -o pipefail 下用 || true 兜住）。
+            ( yes 2>/dev/null || true ) | "$SDKMGR" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
+            "$SDKMGR" --sdk_root="$SDK" "${missing[@]}"
+          else
+            echo "所需 SDK 组件均已安装，跳过下载。"
+          fi
+
+          # build.py 只有在 ANDROID_NDK_HOME 有值时才自动执行 native/build.sh；
+          # 而镜像已预设该变量为它自带的 NDK（不是 pinned 版本），这里必须覆盖。
+          NDK_DIR="$SDK/ndk/$NDK_VERSION"
+          if [[ ! -d "$NDK_DIR" ]]; then
+            # 极端情况下（下载源抖动）退到镜像已装的 27.x，而不是直接失败。
+            NDK_DIR="$(find "$SDK/ndk" -maxdepth 1 -mindepth 1 -type d -name '27.*' -print 2>/dev/null | sort -V | tail -n 1)" || true
+            if [[ -z "$NDK_DIR" ]]; then
+              echo "::error::既没有 NDK $NDK_VERSION，也没有任何 27.x NDK 可用"
+              exit 1
+            fi
+            echo "::warning::未装上 NDK $NDK_VERSION，回退到已有的 $(basename "$NDK_DIR")"
+          fi
+          # native/build.sh 用 hosts 路径 prebuilt/linux-x86_64 拼 clang，先验证它真的可用。
+          CLANG="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android${ANDROID_API}-clang"
+          if [[ ! -x "$CLANG" ]]; then
+            echo "::error::该 NDK 不含可用的 arm64 API $ANDROID_API clang：$CLANG"
+            exit 1
+          fi
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          # 部分工具链脚本优先读 ANDROID_NDK_ROOT，一起设置保持同源。
+          echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
+
+      - name: 打印最终工具链版本
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "JAVA_HOME=$JAVA_HOME"
+          python3 --version
+          java -version 2>&1 | sed 's/^/  /'
+          javac -version 2>&1 | sed 's/^/  /'
+          echo "== platforms =="
+          sed -n "s/^Pkg.Revision=/android-$ANDROID_API revision=/p" "$ANDROID_HOME/platforms/android-$ANDROID_API/source.properties"
+          echo "== build-tools =="
+          ls -1 "$ANDROID_HOME/build-tools" | sed 's/^/  /'
+          sed -n "s/^Pkg.Revision=/build-tools $BUILD_TOOLS_VERSION revision=/p" "$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/source.properties"
+          echo "== ndk =="
+          ls -1 "$ANDROID_HOME/ndk" | sed 's/^/  /'
+          sed -n 's/^Pkg.Revision=/ndk revision=/p' "$ANDROID_NDK_HOME/source.properties"
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$ANDROID_API-clang" --version | head -n 1 | sed 's/^/  /'
+
+      - name: Java 单元测试（全绿才继续）
+        id: java_tests
+        run: |
+          set -euo pipefail
+          # run_java.py 只要求 JAVA_HOME（setup-java 已设置），编译并逐一运行
+          # Java 协议/图像/连接回归测试；任一失败时 check=True 会让本步骤失败。
+          python3 tests/run_java.py 2>&1 | tee "$RUNNER_TEMP/java-tests.log"
+
+      - name: C 单元测试（ASan/UBSan，失败只记录不阻断）
+        id: c_tests
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -uo pipefail
+          # Ubuntu 24.04 把 vm.mmap_rnd_bits 调高，ASan 启动时会报
+          # "Shadow memory range interleaves with an existing memory mapping" 直接崩；
+          # 这一步内临时调低。没有权限时只告警，继续用无 ASan 的结果判断。
+          sudo sysctl -w vm.mmap_rnd_bits=28 >/dev/null 2>&1 ||             echo "::warning::无法调低 vm.mmap_rnd_bits，ASan 可能在启动阶段失败"
+
+          CC_BIN="$(command -v clang || command -v cc || true)"
+          if [[ -z "$CC_BIN" ]]; then
+            echo "::error::runner 上没有 clang 或 cc"
+            exit 1
+          fi
+          echo "compiler: $CC_BIN ($("$CC_BIN" --version | head -n 1))"
+
+          mkdir -p build
+          failed=0
+          for t in nci_rewrite hal_discovery hook_debug; do
+            out="build/${t}-test"
+            echo "== $t =="
+            if "$CC_BIN" -std=c11 -O1 -g -Wall -Wextra -Werror \
+                 -fsanitize=address,undefined "tests/${t}_test.c" -o "$out"; then
+              "$out" || failed=1
+            else
+              failed=1
+            fi
+          done
+          if (( failed )); then
+            echo "::error::有 C 测试失败：已记录，不阻断 APK 构建"
+            exit 1
+          fi
+          echo "C 测试全部通过"
+
+      - name: 构建 APK（javac -> d8 -> aapt -> apksigner）
+        id: build
+        run: |
+          set -euo pipefail
+          # build.py 要求 ANDROID_HOME / JAVA_HOME / ANDROID_NDK_HOME：
+          # 有 NDK 时会先跑 native/build.sh 生成 assets/native/arm64-v8a/*，
+          # 并校验 assets/native/build.sha256；缺失或过期会 RuntimeError。
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "JAVA_HOME=$JAVA_HOME"
+          python3 build.py 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: 收集构建元数据
+        id: meta
+        env:
+          C_TESTS_OUTCOME: ${{ steps.c_tests.outcome }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          apks=(dist/*.apk)
+          sums=(dist/*.sha256)
+          if (( ${#apks[@]} != 1 || ${#sums[@]} != 1 )); then
+            echo "::error::dist/ 里应当恰好有 1 个 .apk 与 1 个 .sha256，实际 ${#apks[@]}/${#sums[@]}"
+            ls -l dist || true
+            exit 1
+          fi
+          apk="${apks[0]}"
+          sum="${sums[0]}"
+          apk_name="$(basename "$apk")"
+          version="${apk_name%.apk}"
+          version="${version#QPollLab-}"
+          sha="$(awk '{print $1}' "$sum")"
+          short_sha="$(git rev-parse --short=8 HEAD)"
+          tag="ci-${short_sha}-${GITHUB_RUN_NUMBER}"
+          size="$(stat -c %s "$apk")"
+          echo "APK=$apk ($size bytes, version $version)"
+          echo "SHA256=$sha"
+          echo "TAG=$tag"
+
+          {
+            echo "apk=$apk"
+            echo "apk_name=$apk_name"
+            echo "sum=$sum"
+            echo "version=$version"
+            echo "sha256=$sha"
+            echo "short_sha=$short_sha"
+            echo "tag=$tag"
+            echo "size=$size"
+            echo "artifact=QPollLab-${version}-${short_sha}-run${GITHUB_RUN_NUMBER}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Release 正文（workflow_dispatch 时使用；push 时只生成不使用）。
+          # 注意：heredoc 不带引号，追求的是变量展开；正文里因此不使用反引号。
+          if [[ "${C_TESTS_OUTCOME:-}" == "success" ]]; then
+            c_note="通过"
+          else
+            c_note="失败（已记录，不阻断 APK，详见 Actions 日志）"
+          fi
+          cat > "$RUNNER_TEMP/release-body.md" <<EOF
+          ## QPollLab $version — CI 构建
+
+          - commit: $GITHUB_SHA
+          - ref: $GITHUB_REF_NAME（触发方式：$GITHUB_EVENT_NAME）
+          - Actions run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - APK: $apk_name
+          - SHA-256: $sha
+
+          ### 验证结论
+
+          - Java 协议 / 图像 / 连接回归（python3 tests/run_java.py）：通过
+          - C 单元测试（ASan + UBSan，失败不阻断 APK）：$c_note
+          - APK 构建与 apksigner 校验：通过（build.py 内已执行 apksigner verify + aapt badging）
+
+          ### 说明
+
+          - 本次构建不使用 Gradle，全部走 Android SDK 命令行工具（javac -> d8 -> aapt -> zipalign -> apksigner）。
+          - APK 由 CI 每次临时生成的 debug keystore 签名，仅用于测试；签名证书与其它构建不通用，
+            覆盖安装前请先执行 adb uninstall org.nfcresearch.qpolllab。
+          - 校验下载：sha256sum -c $apk_name.sha256
+          EOF
+
+      - name: 上传 APK 与 SHA-256 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.artifact }}
+          path: |
+            dist/*.apk
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 GitHub Release（仅手动触发）
+        id: release
+        # push 构建只产出 artifact；只有 workflow_dispatch 才发布 Release。
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: QPollLab ${{ steps.meta.outputs.version }}
+          body_path: ${{ runner.temp }}/release-body.md
+          files: |
+            dist/*.apk
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          # tag 钉在这次实际检出的 commit 上（手动触发时 ref 可能与默认分支不同）。
+          target_commitish: ${{ github.sha }}
+          # CI 产物是测试用途、debug 签名，标成 prerelease。
+          prerelease: true
+          token: ${{ github.token }}
+
+      - name: 写入 Job Summary
+        if: always()
+        env:
+          APK: ${{ steps.meta.outputs.apk }}
+          APK_NAME: ${{ steps.meta.outputs.apk_name }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA256: ${{ steps.meta.outputs.sha256 }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          JOB_OUTCOME: ${{ job.status }}
+          C_TESTS: ${{ steps.c_tests.outcome }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## QPollLab CI"
+            echo
+            echo "- 提交: $GITHUB_SHA"
+            echo "- ref: $GITHUB_REF_NAME（$GITHUB_EVENT_NAME）"
+            echo "- 作业状态: ${JOB_OUTCOME:-unknown}"
+            if [[ "${APK_NAME:-}" ]]; then
+              echo "- APK: $APK_NAME（version $VERSION）"
+              echo "- SHA-256: $SHA256"
+            fi
+            if [[ "${C_TESTS:-}" == "success" ]]; then
+              echo "- C 测试: 通过"
+            elif [[ -n "${C_TESTS:-}" ]]; then
+              echo "- C 测试: $C_TESTS（未阻断 APK）"
+            fi
+            if [[ -n "${RELEASE_URL:-}" ]]; then
+              echo "- Release: $RELEASE_URL"
+            fi
+            echo
+            echo "Java 测试结论见 "Java 单元测试" 步骤；构建日志见 "构建 APK" 步骤。"
+          } >> "$GITHUB_STEP_SUMMARY"
